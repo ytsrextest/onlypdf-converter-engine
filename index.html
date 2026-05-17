@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <script src="coi-serviceworker.js"></script>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PDF Processing Bridge</title>
+</head>
+<body>
+  <script>
+    // ─── Native Fetch Interceptor & Bridge ──────────────────────────────────
+    window.pendingFetchRequests = {};
+
+    const originalFetch = window.fetch;
+    window.fetch = async function(resource, init) {
+      let url = '';
+      if (typeof resource === 'string') {
+        url = resource;
+      } else if (resource && typeof resource === 'object' && resource.href) {
+        url = resource.href;
+      } else if (resource && typeof resource === 'object' && resource.url) {
+        url = resource.url;
+      } else if (resource) {
+        url = resource.toString();
+      }
+
+      // Intercept local assets and route through React Native's FS
+      if (
+        url.startsWith('file://') || 
+        url.includes('/android_asset/') || 
+        (!url.includes('://') && !url.startsWith('data:'))
+      ) {
+        let relativePath = url;
+        
+        if (relativePath.startsWith('file:///android_asset/webview/')) {
+          relativePath = relativePath.replace('file:///android_asset/webview/', '');
+        } else if (relativePath.startsWith('file://')) {
+          const index = relativePath.indexOf('/webview/');
+          if (index !== -1) {
+            relativePath = relativePath.substring(index + 9);
+          } else {
+            relativePath = relativePath.replace('file://', '');
+          }
+        }
+        
+        relativePath = relativePath.replace(/^\.?\//, '');
+
+        return new Promise((resolve, reject) => {
+          const requestId = 'fetch_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9);
+          window.pendingFetchRequests[requestId] = { resolve, reject, relativePath };
+          
+          sendToRN({
+            type: 'fetch-file',
+            requestId: requestId,
+            path: relativePath
+          });
+        });
+      }
+
+      return originalFetch.apply(this, arguments);
+    };
+
+    function handleFetchResponse(data) {
+      const req = window.pendingFetchRequests[data.requestId];
+      if (!req) return;
+
+      delete window.pendingFetchRequests[data.requestId];
+
+      if (data.error) {
+        req.reject(new Error(data.error));
+        return;
+      }
+
+      try {
+        const binaryString = atob(data.base64);
+        const len = binaryString.length;
+        const bytes = new Uint8Array(len);
+        for (let i = 0; i < len; i++) {
+          bytes[i] = binaryString.charCodeAt(i);
+        }
+
+        const mimeType = req.relativePath.endsWith('.wasm') ? 'application/wasm' :
+                         req.relativePath.endsWith('.json') ? 'application/json' :
+                         req.relativePath.endsWith('.zip') ? 'application/zip' :
+                         'application/octet-stream';
+
+        const response = new Response(bytes, {
+          status: 200,
+          statusText: 'OK',
+          headers: new Headers({
+            'Content-Type': mimeType
+          })
+        });
+
+        req.resolve(response);
+      } catch (err) {
+        req.reject(err);
+      }
+    }
+
+    // ─── Output extension map ────────────────────────────────────────────────
+    const OUTPUT_EXT = {
+      'pdf-to-docx':   '.docx',
+      'pdf-to-excel':  '.xlsx',
+      'pdf-to-pptx':   '.pptx',
+      'pdf-to-img':    '.jpg',
+      'pdf-to-jpg':    '.jpg',
+      'pdf-to-png':    '.png',
+      'pdf-to-text':   '.txt',
+      'img-to-pdf':    '.pdf',
+      'jpg-to-pdf':    '.pdf',
+      'png-to-pdf':    '.pdf',
+      'word-to-pdf':   '.pdf',
+      'excel-to-pdf':  '.pdf',
+      'ppt-to-pdf':    '.pdf',
+      'compress':      '.pdf',
+      'encrypt':       '.pdf',
+      'decrypt':       '.pdf',
+      'merge':         '.pdf',
+      'split':         '.pdf',
+    };
+
+    function getOutputName(toolType, originalName) {
+      const ext = OUTPUT_EXT[toolType] || '.pdf';
+      const base = originalName.replace(/\.[^/.]+$/, '');
+      return `${base}_${toolType}${ext}`;
+    }
+
+    // ─── RN Bridge ───────────────────────────────────────────────────────────
+    function sendToRN(payload) {
+      if (window.ReactNativeWebView) {
+        window.ReactNativeWebView.postMessage(JSON.stringify(payload));
+      } else {
+        console.log('No RN bridge:', payload);
+      }
+    }
+
+    let activeWorkerType = null;
+
+    // Start background preloading after a brief startup delay (5 seconds to let RN settle)
+    setTimeout(() => {
+      preloadEngine('pdf-to-docx');
+    }, 5000);
+
+    async function preloadEngine(type) {
+      console.log('Preloading offline engine in background for:', type);
+      activeWorkerType = type;
+
+      // Mock postMessage to handle background initialization silently
+      window.postMessage = (msg) => {
+        if (msg.type === 'status') {
+          console.log('Preload Status:', msg.message);
+        } else if (msg.type === 'init-complete') {
+          sendToRN({ type: 'init-complete' });
+        } else if (msg.type === 'fetch-file') {
+          // Route asset fetches natively so packages are cached in background
+          sendToRN(msg);
+        }
+      };
+
+      const scriptId = 'active-worker-script';
+      const existingScript = document.getElementById(scriptId);
+      if (existingScript) existingScript.remove();
+
+      const script = document.createElement('script');
+      script.id = scriptId;
+      script.type = 'module';
+      script.src = `./workers/${type}.worker.js`;
+
+      script.onload = () => {
+        setTimeout(() => {
+          if (typeof window.onmessage === 'function') {
+            window.onmessage({
+              data: {
+                type: 'init',
+                id: Date.now()
+              }
+            });
+          }
+        }, 100);
+      };
+
+      document.body.appendChild(script);
+    }
+
+    sendToRN({ type: 'ready' });
+
+    document.addEventListener('message', function(event) { handleMessage(event.data); });
+    window.addEventListener('message', function(event) { handleMessage(event.data); });
+
+    function handleMessage(dataStr) {
+      try {
+        const data = JSON.parse(dataStr);
+        if (data.action === 'processPDF') {
+          processFile(data);
+        } else if (data.action === 'fetch-response') {
+          handleFetchResponse(data);
+        }
+      } catch (e) {
+        sendToRN({ type: 'error', error: 'Bridge parse error: ' + e.toString() });
+      }
+    }
+
+    // ─── Core Processing (Main-Thread Module Runner) ───────────────────────────
+    async function processFile(data) {
+      const { type, fileName } = data;
+      sendToRN({ type: 'progress', progress: 0.05, status: 'Initializing engine...' });
+
+      // Connect window.postMessage to our active conversion listener
+      window.postMessage = (msg) => {
+        handleWorkerMessage(msg);
+      };
+
+      function handleWorkerMessage(msg) {
+        if (msg.type === 'status') {
+          sendToRN({ type: 'progress', progress: 0.2, status: msg.message || 'Working...' });
+        } else if (msg.type === 'progress') {
+          const pct = typeof msg.percent === 'number' ? msg.percent / 100 : 0.5;
+          sendToRN({ type: 'progress', progress: 0.2 + pct * 0.7, status: msg.message || 'Processing...' });
+        } else if (msg.type === 'convert-complete') {
+          sendToRN({ type: 'progress', progress: 0.95, status: 'Finalizing output...' });
+
+          const resultBlob = msg.result;
+          const outName = msg.fileName || getOutputName(type, fileName);
+
+          const reader = new FileReader();
+          reader.onloadend = () => {
+            sendToRN({ type: 'success', base64: reader.result, fileName: outName });
+          };
+          reader.onerror = () => {
+            sendToRN({ type: 'error', error: 'Failed to encode result to base64' });
+          };
+          reader.readAsDataURL(resultBlob);
+
+        } else if (msg.type === 'error') {
+          sendToRN({ type: 'error', error: msg.error });
+        } else if (msg.type === 'fetch-file') {
+          sendToRN(msg);
+        }
+      }
+
+      // Convert Base64 data to blob
+      let blob;
+      try {
+        sendToRN({ type: 'progress', progress: 0.12, status: 'Parsing input file...' });
+
+        const binaryString = atob(data.fileBase64);
+        const len = binaryString.length;
+        const bytes = new Uint8Array(len);
+        for (let i = 0; i < len; i++) {
+          bytes[i] = binaryString.charCodeAt(i);
+        }
+        const arrayBuffer = bytes.buffer;
+
+        const mimeType = fileName.match(/\.(png)$/i) ? 'image/png' : 
+                         fileName.match(/\.(jpg|jpeg)$/i) ? 'image/jpeg' : 
+                         fileName.match(/\.(docx|doc)$/i) ? 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' :
+                         fileName.match(/\.(xlsx|xls)$/i) ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' :
+                         'application/pdf';
+        blob = new Blob([arrayBuffer], { type: mimeType });
+      } catch (err) {
+        sendToRN({ type: 'error', error: 'File decoding error: ' + err.message });
+        return;
+      }
+
+      // Reuse preloaded engine context in memory if available!
+      if (activeWorkerType === type && typeof window.onmessage === 'function') {
+        sendToRN({ type: 'progress', progress: 0.18, status: 'Starting offline task...' });
+        window.onmessage({
+          data: {
+            type: 'convert',
+            id: Date.now(),
+            data: { file: blob }
+          }
+        });
+        return;
+      }
+
+      // Fallback: Load script on the fly if user changes the selected tool type
+      activeWorkerType = type;
+      sendToRN({ type: 'progress', progress: 0.15, status: 'Loading offline converter...' });
+
+      const scriptId = 'active-worker-script';
+      const existingScript = document.getElementById(scriptId);
+      if (existingScript) existingScript.remove();
+
+      const script = document.createElement('script');
+      script.id = scriptId;
+      script.type = 'module';
+      script.src = `./workers/${type}.worker.js`;
+
+      script.onload = () => {
+        sendToRN({ type: 'progress', progress: 0.18, status: 'Starting offline task...' });
+        setTimeout(() => {
+          if (typeof window.onmessage === 'function') {
+            window.onmessage({
+              data: {
+                type: 'convert',
+                id: Date.now(),
+                data: { file: blob }
+              }
+            });
+          } else {
+            sendToRN({ type: 'error', error: 'Converter failed to register conversion handler' });
+          }
+        }, 100);
+      };
+
+      script.onerror = (e) => {
+        sendToRN({ type: 'error', error: `Could not load offline converter for "${type}"` });
+      };
+
+      document.body.appendChild(script);
+    }
+  </script>
+</body>
+</html>
