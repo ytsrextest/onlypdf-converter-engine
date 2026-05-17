@@ -10,6 +10,14 @@
     // ─── Native Fetch Interceptor & Bridge ──────────────────────────────────
     window.pendingFetchRequests = {};
 
+    function getWorkerFilename(type) {
+      if (type === 'ppt-to-pdf') {
+        return 'pptx-to-pdf';
+      }
+      return type;
+    }
+
+
     const originalFetch = window.fetch;
     window.fetch = async function(resource, init) {
       let url = '';
@@ -164,7 +172,8 @@
       const script = document.createElement('script');
       script.id = scriptId;
       script.type = 'module';
-      script.src = `./workers/${type}.worker.js`;
+      script.src = `./workers/${getWorkerFilename(type)}.worker.js`;
+
 
       script.onload = () => {
         setTimeout(() => {
@@ -286,7 +295,8 @@
       const script = document.createElement('script');
       script.id = scriptId;
       script.type = 'module';
-      script.src = `./workers/${type}.worker.js`;
+      script.src = `./workers/${getWorkerFilename(type)}.worker.js`;
+
 
       script.onload = () => {
         sendToRN({ type: 'progress', progress: 0.18, status: 'Starting offline task...' });
